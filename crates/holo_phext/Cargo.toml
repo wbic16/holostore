@@ -1,0 +1,13 @@
+[package]
+name = "holo_phext"
+version = "0.1.0"
+edition = "2021"
+description = "HoloStore's storage core re-implemented phext-natively: one text file is the WAL, the snapshot, and the state. An experiment in complexity elimination; see PHEXT.md round 2."
+license = "MIT"
+
+[dependencies]
+libphext = "0.6"
+
+# Detached from the parent workspace: this crate is an experiment vehicle,
+# not a member of the upstream build.
+[workspace]
