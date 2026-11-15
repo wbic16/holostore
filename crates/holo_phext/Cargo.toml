@@ -1,12 +1,16 @@
 [package]
 name = "holo_phext"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "HoloStore's storage core re-implemented phext-natively: one text file is the WAL, the snapshot, and the state. An experiment in complexity elimination; see PHEXT.md round 2."
+description = "HoloStore's storage core on the HoloPhext engine: the round-2 phext-native design, with the hand-rolled store replaced by the layer2 protocol crate. See PHEXT.md round 3."
 license = "MIT"
 
 [dependencies]
-libphext = "0.6"
+# libphext 0.6.2 (git rev until the crates.io publish lands) — the
+# engine requires the 0.6.2 conventions, and both crates must agree
+# on ONE libphext so Coordinate is one type.
+libphext = { git = "https://github.com/wbic16/libphext-rs", rev = "af3867c", features = ["binary"] }
+holo-phext = { git = "https://github.com/wbic16/holo-phext", rev = "90cd6e975974e563eb700748df58faec5c7eca09" }
 
 # Detached from the parent workspace: this crate is an experiment vehicle,
 # not a member of the upstream build.
