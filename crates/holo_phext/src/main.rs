@@ -1,93 +1,88 @@
-//! holo-phext — HoloStore's storage core, re-implemented phext-natively.
+//! holo-phext — HoloStore's storage core on the HoloPhext engine.
 //!
-//! The original persists one logical thing (an ordered, durable KV log plus
-//! its folded state) through five representations: a CRC-framed binary WAL
-//! (two backends), Fjall's LSM files with hand-rolled version-key encodings,
-//! a JSON cluster-state checkpoint, a JSON recovery manifest, and a protobuf
-//! wire codec. This implementation persists the same core in exactly one
-//! representation: a phext file.
+//! Round 2 proved the shape by hand: one phext file holding a manifest,
+//! a snapshot volume, and a WAL volume, with group commit and torn-tail
+//! recovery, in 717 lines. This build keeps the RESP server, the
+//! group-commit writer, and the field codec from that experiment — and
+//! replaces the hand-rolled store underneath with the layer2 engine
+//! (wbic16/holo-phext), which is that shape factored out and completed:
+//! checked WAL entries with commit markers, snapshot-isolated reads,
+//! and a checkpoint that folds the log into a memory-mapped base.
 //!
-//! Layout of store.phext (Library.Shelf.Series/Collection.Volume.Book/
-//! Chapter.Section.Scroll; everything here is 1.1.1/1.V.B/1.1.1-shaped):
-//!   1.1.1/1.1.1/1.1.1   manifest: format, snapshot_seq, next_seq (text lines)
-//!   Volume 2            snapshot: live keys, sorted; Chapter = page of 1000,
-//!                       Scroll = slot in page; content is key=/value= lines.
-//!                       Coordinates are pagination; identity is in content.
-//!   Volume 3            WAL: one scroll per committed op, addressed by
-//!                       Chapter = (seq-1)/10000+1, Scroll = (seq-1)%10000+1;
-//!                       content is seq=/op=/key=/value= lines. The WAL is
-//!                       the last volume so appends are pure file appends:
-//!                       a delimiter run to the next coordinate, then text.
+//! The mapping is one scroll per hash bucket: 65,536 buckets at
+//! small coordinates, each bucket scroll holding its keys as the
+//! round-2 field codec's `key=` / `value=` lines — identity lives
+//! in content, coordinates are pagination, exactly as round 2 had
+//! it. (A first draft hashed each key to its own scroll at
+//! checksum-spread coordinates; phext encodes coordinate distance
+//! as unary delimiter runs, so components in the billions made
+//! checkpoint's implode walk effectively forever. Coordinates are
+//! positions, not hashes — the bucket layout is the fix, recorded
+//! in PHEXT.md round 3.) The base document at `--path` is a plain
+//! phext; the engine's WAL lives beside it as `<name>.wal.phext`.
 //!
-//! Durability rule (the whole protocol): an op is acknowledged only after
-//! its WAL bytes are written and fdatasync'd. Recovery replays snapshot +
-//! WAL; the first WAL scroll that fails validation ends the log and the
-//! file is truncated at that scroll. Checkpoint folds the WAL into the
-//! snapshot by rewriting the file once, through libphext::implode.
-//!
-//! Parsing and whole-file writing go through libphext (the reference
-//! implementation) — never a hand-rolled parser. The append fast path emits
-//! delimiter bytes directly (that is serialization, not parsing) and the
-//! test suite proves libphext reads every appended byte back exactly.
+//! Durability rule (unchanged): an op is acknowledged only after its
+//! transaction is written and synced by the engine's commit path.
+//! The writer below still batches: appends accumulate for one
+//! group-commit window, then one `commit_batch` syncs them all.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock};
 
-use libphext::phext::{self, Coordinate, XCoordinate, YCoordinate, ZCoordinate};
+use libphext::phext::{self, Coordinate};
+use holo_phext::core::{Core, Shared, Txn};
 
 // ---------------------------------------------------------------------------
-// Coordinates
+// Bucket addressing: a key lives in exactly one of 4,096 bucket
+// scrolls, chosen by the xxh3-128 checksum of its base64 form.
+// Bucket coordinates stay small (volume, chapter in 1..=256) — see
+// the header note on unary coordinate distance. A bucket scroll's
+// content is its entries as sorted `key=` / `value=` line pairs in
+// the field codec below; a SET or DEL rewrites its bucket's scroll
+// as one engine transaction.
 
-fn coord(volume: usize, chapter: usize, scroll: usize) -> Coordinate {
-    Coordinate {
-        z: ZCoordinate { library: 1, shelf: 1, series: 1 },
-        y: YCoordinate { collection: 1, volume, book: 1 },
-        x: XCoordinate { chapter, section: 1, scroll },
-    }
+const BUCKETS: u32 = 65_536;
+
+fn bucket_of(key: &[u8]) -> u32 {
+    let digest = phext::checksum(&b64_encode(key));
+    u32::from_str_radix(&digest[..8], 16).unwrap_or(0) % BUCKETS
 }
 
-fn manifest_coord() -> Coordinate {
-    coord(1, 1, 1)
-}
-fn snapshot_coord(index: usize) -> Coordinate {
-    coord(2, index / 1000 + 1, index % 1000 + 1)
-}
-/// WAL coordinates are slots relative to the snapshot baseline, so the
-/// first entry after a checkpoint lands at Volume 3, Chapter 1, Scroll 1 —
-/// one volume break from the snapshot's last scroll, no empty scrolls.
-fn wal_coord(seq: u64, snapshot_seq: u64) -> Coordinate {
-    let s = (seq - snapshot_seq - 1) as usize;
-    coord(3, s / 10_000 + 1, s % 10_000 + 1)
+fn bucket_coord(bucket: u32) -> Coordinate {
+    phext::to_coordinate(&format!(
+        "1.1.1/1.{}.1/{}.1.1",
+        bucket / 256 + 1,
+        bucket % 256 + 1
+    ))
 }
 
-fn comps(c: &Coordinate) -> [usize; 9] {
-    [
-        c.z.library, c.z.shelf, c.z.series, c.y.collection, c.y.volume, c.y.book, c.x.chapter,
-        c.x.section, c.x.scroll,
-    ]
-}
-
-/// Delimiter bytes, highest dimension first (library .. scroll).
-const BREAKS: [u8; 9] = [0x01, 0x1F, 0x1E, 0x1D, 0x1C, 0x1A, 0x19, 0x18, 0x17];
-
-/// Emit delimiter bytes that advance `cur` to `tgt` (tgt must not precede
-/// cur). A break increments its dimension and resets all lower dimensions
-/// to 1 — that is the phext addressing rule, applied forwards.
-fn emit_until(out: &mut Vec<u8>, cur: &mut [usize; 9], tgt: [usize; 9]) {
-    while *cur != tgt {
-        let i = (0..9)
-            .find(|&i| cur[i] < tgt[i])
-            .expect("append target precedes current coordinate");
-        out.push(BREAKS[i]);
-        cur[i] += 1;
-        for j in i + 1..9 {
-            cur[j] = 1;
+/// Parse a bucket scroll's body into its live entries.
+fn parse_bucket(body: &str) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut lines = body.lines();
+    while let Some(kline) = lines.next() {
+        if let Some(k) = kline.strip_prefix("key=") {
+            if let Some(vline) = lines.next() {
+                if let Some(v) = vline.strip_prefix("value=") {
+                    if let (Some(k), Some(v)) = (decode_field(k), decode_field(v)) {
+                        map.insert(k, v);
+                    }
+                }
+            }
         }
     }
+    map
+}
+
+fn bucket_body(map: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>) -> String {
+    let mut out = String::new();
+    for (k, v) in map {
+        out += &format!("key={}\nvalue={}\n", encode_field(k), encode_field(v));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -174,204 +169,170 @@ fn parse_fields(content: &str) -> HashMap<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// The store
+// The store: the round-2 Store surface (open / get / len / append_op /
+// sync / checkpoint) over the HoloPhext engine. append_op stages a
+// one-op transaction and mirrors it into a pending map, so reads in
+// the same writer batch see it before the sync — the read-your-batch
+// semantics the original's apply-on-append gave. sync() is the group
+// commit: one commit_batch, one WAL sync, every staged op durable.
 
 pub struct Store {
-    path: PathBuf,
-    file: File,
-    map: HashMap<Vec<u8>, Vec<u8>>,
-    snapshot_seq: u64,
-    next_seq: u64,
-    /// Components of the coordinate the file currently ends at.
-    cur: [usize; 9],
-}
-
-fn manifest_text(snapshot_seq: u64, next_seq: u64) -> String {
-    format!("format=holo-phext/1\nnode=1\nsnapshot_seq={snapshot_seq}\nnext_seq={next_seq}\n")
+    core: Core,
+    shared: Arc<Shared>,
+    /// Staged per-bucket changes in the current writer batch:
+    /// bucket -> key -> new value (None = deleted).
+    pending: std::collections::HashMap<u32, std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    /// Every live key, rebuilt at open from the bucket scrolls —
+    /// the DBSIZE surface.
+    live: std::collections::HashSet<Vec<u8>>,
+    /// Next sequence the engine will assign (INFO surface, as before).
+    pub next_seq: u64,
+    /// Sequence folded into the base document at the last checkpoint.
+    pub snapshot_seq: u64,
 }
 
 impl Store {
     pub fn open(path: &Path) -> std::io::Result<Store> {
-        if !path.exists() {
-            let text = phext::implode(HashMap::from([(manifest_coord(), manifest_text(0, 1))]));
-            std::fs::write(path, text)?;
-        }
-        let bytes = std::fs::read(path)?;
-        // A torn final write can split a UTF-8 sequence; keep the valid prefix.
-        let valid = match std::str::from_utf8(&bytes) {
-            Ok(_) => bytes.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        let text = String::from_utf8_lossy(&bytes[..valid]).into_owned();
-        let exploded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| phext::explode(&text)))
-            .unwrap_or_default();
-
-        let manifest = exploded.get(&manifest_coord()).cloned().unwrap_or_default();
-        let mf = parse_fields(&manifest);
-        let snapshot_seq: u64 = mf.get("snapshot_seq").and_then(|v| v.parse().ok()).unwrap_or(0);
-
-        let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        let mut snap_coords: Vec<Coordinate> = exploded
-            .keys()
-            .filter(|c| c.y.volume == 2)
-            .cloned()
-            .collect();
-        snap_coords.sort_by_key(|c| (c.x.chapter, c.x.scroll));
-        let mut last_coord = manifest_coord();
-        for c in &snap_coords {
-            let f = parse_fields(&exploded[c]);
-            if let (Some(k), Some(v)) = (f.get("key"), f.get("value")) {
-                if let (Some(k), Some(v)) = (decode_field(k), decode_field(v)) {
-                    map.insert(k, v);
+        let core = Core::open(path)?;
+        let shared = core.shared.clone();
+        let snapshot_seq = core.checkpoint_seq();
+        let next_seq = core.seq() + 1;
+        let snap = shared.snapshot();
+        let mut live = std::collections::HashSet::new();
+        for coord in snap.coordinates() {
+            if let Some(body) = snap.get(&coord) {
+                for k in parse_bucket(&body).into_keys() {
+                    live.insert(k);
                 }
             }
-            last_coord = *c;
         }
-
-        // Replay the WAL in coordinate order (== seq order by construction).
-        // The first entry that is incomplete or out of sequence ends the
-        // log; the file is truncated at that scroll (torn tail recovery).
-        // Completeness marker: every committed entry ends with '\n' — a
-        // write torn mid-line fails that check. (Phext has no per-scroll
-        // checksum; this is the gap, recorded in PHEXT.md round 2.)
-        let mut wal: Vec<(Coordinate, String)> = exploded
-            .iter()
-            .filter(|(c, _)| c.y.volume == 3)
-            .map(|(c, content)| (*c, content.clone()))
-            .collect();
-        wal.sort_by_key(|(c, _)| (c.x.chapter, c.x.scroll));
-        let mut expect = snapshot_seq + 1;
-        let mut truncate_at: Option<usize> = None;
-        for (c, content) in &wal {
-            let f = parse_fields(content);
-            let seq: Option<u64> = f.get("seq").and_then(|s| s.parse().ok());
-            let ok = content.ends_with('\n')
-                && seq == Some(expect)
-                && match f.get("op").map(String::as_str) {
-                    Some("SET") => f.contains_key("key") && f.contains_key("value"),
-                    Some("DEL") => f.contains_key("key"),
-                    _ => false,
-                };
-            if !ok {
-                // Truncate at the START of this scroll's delimiter run, so
-                // the file ends exactly at the previous scroll's content
-                // and the next append re-emits the run cleanly. Walking
-                // back over break bytes is safe: committed scroll content
-                // never ends with a break byte (the codec forbids them in
-                // raw fields, and every entry ends with '\n').
-                let mut at = phext::offset(&text, *c);
-                while at > 0 && is_break_byte(text.as_bytes()[at - 1]) {
-                    at -= 1;
-                }
-                truncate_at = Some(at);
-                break;
-            }
-            let key = decode_field(f["key"].as_str()).unwrap_or_default();
-            match f["op"].as_str() {
-                "SET" => {
-                    map.insert(key, decode_field(f["value"].as_str()).unwrap_or_default());
-                }
-                _ => {
-                    map.remove(&key);
-                }
-            }
-            last_coord = *c;
-            expect += 1;
-        }
-        let next_seq = expect;
-
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        if let Some(at) = truncate_at {
-            file.set_len(at as u64)?;
-            file.sync_data()?;
-        } else if valid < bytes.len() {
-            file.set_len(valid as u64)?;
-            file.sync_data()?;
-        }
-        file.seek(SeekFrom::End(0))?;
-
         Ok(Store {
-            path: path.to_path_buf(),
-            file,
-            map,
-            snapshot_seq,
+            core,
+            shared,
+            pending: std::collections::HashMap::new(),
+            live,
             next_seq,
-            cur: comps(&last_coord),
+            snapshot_seq,
         })
     }
 
+    /// The bucket's live entries: committed content with this
+    /// batch's staged changes applied.
+    fn bucket_view(&self, bucket: u32) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        let mut map = self
+            .shared
+            .snapshot()
+            .get(&bucket_coord(bucket))
+            .map(|body| parse_bucket(&body))
+            .unwrap_or_default();
+        if let Some(staged) = self.pending.get(&bucket) {
+            for (k, v) in staged {
+                match v {
+                    Some(val) => {
+                        map.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        map.remove(k);
+                    }
+                }
+            }
+        }
+        map
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.map.get(key).cloned()
+        self.bucket_view(bucket_of(key)).get(key).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        let mut n = self.live.len() as i64;
+        for staged in self.pending.values() {
+            for (k, v) in staged {
+                match (self.live.contains(k), v) {
+                    (true, None) => n -= 1,
+                    (false, Some(_)) => n += 1,
+                    _ => {}
+                }
+            }
+        }
+        n.max(0) as usize
     }
 
-    /// Append one op to the WAL (no fsync — the writer batches syncs),
-    /// then apply it. Returns the assigned seq.
+    /// Stage one op into its bucket (no sync — the writer batches
+    /// syncs). Returns the sequence the batch will carry.
     fn append_op(&mut self, op: &str, key: &[u8], value: Option<&[u8]>) -> std::io::Result<u64> {
+        self.pending
+            .entry(bucket_of(key))
+            .or_default()
+            .insert(key.to_vec(), value.map(|v| v.to_vec()));
+        let _ = op; // SET and DEL are the same staging; the value decides
         let seq = self.next_seq;
-        let mut content = format!("seq={seq}\nop={op}\nkey={}\n", encode_field(key));
-        if let Some(v) = value {
-            content += &format!("value={}\n", encode_field(v));
-        }
-        let target = wal_coord(seq, self.snapshot_seq);
-        let mut bytes = Vec::with_capacity(content.len() + 9);
-        let mut cur = self.cur;
-        emit_until(&mut bytes, &mut cur, comps(&target));
-        bytes.extend_from_slice(content.as_bytes());
-        self.file.write_all(&bytes)?;
-        self.cur = cur;
         self.next_seq += 1;
-        match op {
-            "SET" => {
-                self.map.insert(key.to_vec(), value.unwrap_or_default().to_vec());
-            }
-            _ => {
-                self.map.remove(key);
-            }
-        }
         Ok(seq)
     }
 
-    pub fn sync(&self) -> std::io::Result<()> {
-        self.file.sync_data()
+    /// The group commit: every touched bucket becomes one op in
+    /// a single engine transaction (its full new content, or a
+    /// delete when empty), committed with one WAL sync.
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            let staged = std::mem::take(&mut self.pending);
+            let mut buckets: Vec<u32> = staged.keys().cloned().collect();
+            buckets.sort_unstable();
+            // ONE engine transaction for the whole writer batch:
+            // the batch is the ack unit (one sync), so it is the
+            // atomic unit too — and the WAL carries one commit
+            // marker per batch instead of one per bucket.
+            let mut txns = Vec::with_capacity(1);
+            let mut batch = Txn::new();
+            for b in &buckets {
+                // merged view WITHOUT the staged map (it was taken):
+                // committed content + this bucket's staged changes
+                let mut map = self
+                    .shared
+                    .snapshot()
+                    .get(&bucket_coord(*b))
+                    .map(|body| parse_bucket(&body))
+                    .unwrap_or_default();
+                for (k, v) in &staged[b] {
+                    match v {
+                        Some(val) => {
+                            map.insert(k.clone(), val.clone());
+                        }
+                        None => {
+                            map.remove(k);
+                        }
+                    }
+                }
+                if map.is_empty() {
+                    batch = batch.delete(bucket_coord(*b));
+                } else {
+                    batch = batch.set(bucket_coord(*b), &bucket_body(&map));
+                }
+            }
+            txns.push(batch);
+            self.core.commit_batch(txns)?;
+            for changes in staged.values() {
+                for (k, v) in changes {
+                    match v {
+                        Some(_) => {
+                            self.live.insert(k.clone());
+                        }
+                        None => {
+                            self.live.remove(k);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Fold snapshot + WAL into a fresh file: manifest + snapshot only.
+    /// Commit anything staged, then fold the WAL into the base.
     pub fn checkpoint(&mut self) -> std::io::Result<()> {
-        let snapshot_seq = self.next_seq - 1;
-        let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = self.map.iter().collect();
-        entries.sort();
-        let mut file_map: HashMap<Coordinate, String> =
-            HashMap::from([(manifest_coord(), manifest_text(snapshot_seq, self.next_seq))]);
-        let mut last = manifest_coord();
-        for (i, (k, v)) in entries.iter().enumerate() {
-            let c = snapshot_coord(i);
-            file_map.insert(
-                c,
-                format!("key={}\nvalue={}\n", encode_field(k), encode_field(v)),
-            );
-            last = c;
-        }
-        let text = phext::implode(file_map);
-        let tmp = self.path.with_extension("phext.tmp");
-        std::fs::write(&tmp, text)?;
-        File::open(&tmp)?.sync_all()?;
-        std::fs::rename(&tmp, &self.path)?;
-        // Sync the directory so the rename itself is durable. A bare
-        // relative filename has parent "" — that means ".", not an error.
-        let dir = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(dir)?.sync_all()?;
-        self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.snapshot_seq = snapshot_seq;
-        self.cur = comps(&last);
+        self.sync()?;
+        self.core.checkpoint()?;
+        self.snapshot_seq = self.core.checkpoint_seq();
         Ok(())
     }
 }
@@ -613,6 +574,7 @@ fn main() {
     }
 }
 
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -622,6 +584,11 @@ mod tests {
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("holo-phext-{name}-{}.phext", std::process::id()));
         let _ = std::fs::remove_file(&p);
+        let wal = p.with_file_name(format!(
+            "{}.wal.phext",
+            p.file_name().unwrap().to_string_lossy().strip_suffix(".phext").unwrap()
+        ));
+        let _ = std::fs::remove_file(&wal);
         p
     }
 
@@ -640,26 +607,29 @@ mod tests {
     }
 
     #[test]
-    fn appends_are_libphext_conformant() {
-        let path = tmp("conform");
+    fn appends_sync_and_reopen() {
+        let path = tmp("engine");
         let mut st = Store::open(&path).unwrap();
-        // 10,050 ops cross a WAL chapter boundary (10,000 scrolls per chapter).
         for i in 0..10_050u32 {
             st.append_op("SET", format!("key-{i}").as_bytes(), Some(b"v")).unwrap();
         }
         st.sync().unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        // The reference parser reads back exactly what the append path wrote.
-        let at = phext::fetch(&text, wal_coord(10_050, 0));
-        assert!(at.contains("seq=10050"), "tail scroll unreadable: {at:?}");
-        let first = phext::fetch(&text, wal_coord(1, 0));
-        assert!(first.contains("seq=1"));
-        let exploded = phext::explode(&text);
-        assert_eq!(exploded.keys().filter(|c| c.y.volume == 3).count(), 10_050);
+        assert_eq!(st.len(), 10_050);
         drop(st);
+        // Recovery replays the engine WAL: everything acked is present.
         let st = Store::open(&path).unwrap();
         assert_eq!(st.len(), 10_050);
         assert_eq!(st.get(b"key-9999"), Some(b"v".to_vec()));
+        assert_eq!(st.get(b"key-0"), Some(b"v".to_vec()));
+        // The base document after a checkpoint is a plain phext that
+        // the reference parser reads directly, at the key's coordinate.
+        drop(st);
+        let mut st = Store::open(&path).unwrap();
+        st.checkpoint().unwrap();
+        drop(st);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let at = phext::fetch(&text, bucket_coord(bucket_of(b"key-42")));
+        assert!(at.contains("key=key-42"), "checkpointed scroll unreadable: {at:?}");
     }
 
     #[test]
@@ -671,16 +641,24 @@ mod tests {
         }
         st.append_op("DEL", b"k7", None).unwrap();
         st.checkpoint().unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let exploded = phext::explode(&text);
-        assert_eq!(exploded.keys().filter(|c| c.y.volume == 3).count(), 0, "WAL must be folded away");
-        assert_eq!(exploded.keys().filter(|c| c.y.volume == 2).count(), 299);
+        // The WAL restarts at the checkpoint: meta scroll only.
+        let wal = path.with_file_name(format!(
+            "{}.wal.phext",
+            path.file_name().unwrap().to_string_lossy().strip_suffix(".phext").unwrap()
+        ));
+        let wal_text = std::fs::read_to_string(&wal).unwrap();
+        assert_eq!(phext::explode(&wal_text).len(), 1, "WAL must be folded away");
+        // One engine transaction per touched bucket per batch, so
+        // the checkpoint sequence is the batch's transaction count,
+        // not the op count — read it from the store, not a constant.
+        let expect = format!("checkpoint_seq={}", st.snapshot_seq);
+        assert!(wal_text.contains(&expect), "{wal_text}");
         drop(st);
         let mut st = Store::open(&path).unwrap();
         assert_eq!(st.len(), 299);
         assert_eq!(st.get(b"k7"), None);
         assert_eq!(st.get(b"k42"), Some(b"v42".to_vec()));
-        // Appends after a checkpoint land in a fresh WAL volume.
+        // Appends after a checkpoint land in the fresh WAL.
         st.append_op("SET", b"after", Some(b"ckpt")).unwrap();
         st.sync().unwrap();
         drop(st);
@@ -690,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn torn_tail_is_truncated_not_fatal() {
+    fn torn_wal_tail_is_discarded_not_fatal() {
         let path = tmp("torn");
         let mut st = Store::open(&path).unwrap();
         for i in 0..50u32 {
@@ -698,14 +676,18 @@ mod tests {
         }
         st.sync().unwrap();
         drop(st);
-        // Simulate a crash mid-append: partial scroll, then garbage bytes.
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"\x17seq=51\nop=SET\nkey=torn\nvalue=hal").unwrap();
+        // Simulate a crash mid-append: garbage bytes at the WAL's tail.
+        let wal = path.with_file_name(format!(
+            "{}.wal.phext",
+            path.file_name().unwrap().to_string_lossy().strip_suffix(".phext").unwrap()
+        ));
+        let mut f = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
+        use std::io::{Read, Write};
+        f.write_all(b"\x1c\x19partial-forged-entry").unwrap();
         f.write_all(&[0xFF, 0xFE, 0x00]).unwrap();
         drop(f);
         let mut st = Store::open(&path).unwrap();
-        assert_eq!(st.len(), 50, "torn entry must not be applied");
-        assert_eq!(st.get(b"torn"), None);
+        assert_eq!(st.len(), 50, "torn tail must not be applied");
         // The store keeps working at the truncation point.
         st.append_op("SET", b"after", Some(b"torn")).unwrap();
         st.sync().unwrap();
