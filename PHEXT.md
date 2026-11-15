@@ -399,3 +399,80 @@ the irreducible core: ordering, syncing, serving. The gaps above are
 the format's growth list, in the order this build hit them: an append
 writer, per-scroll integrity, a durability profile, a commit primitive,
 and plainer words about empty scrolls.
+
+---
+
+# Round 3 — the storage core, re-based on HoloPhext (2026-11-15)
+
+Round 2 proved the storage model by hand-rolling it. Round 3 swaps
+the hand-rolled store for **HoloPhext** (wbic16/holo-phext) — the
+layer-2 engine that owns what the format cannot: ACID multi-scroll
+atomics, async I/O, update dispatch — keeping round 2's RESP
+surface, group-commit writer, and field codec byte-for-byte. The
+swap is `crates/holo_phext` on branch `emise/holo-phext-engine`
+(stacked on round 2's branch).
+
+**The mapping.** One scroll per hash bucket: 65,536 buckets at
+small coordinates (volume, chapter in 1..=256), each bucket scroll
+holding its keys as sorted `key=`/`value=` field-codec lines. One
+engine transaction per writer batch: every touched bucket is one
+op (its full new content, or a delete when it empties).
+
+A first draft hashed each key to its own scroll at
+checksum-spread coordinates and hung forever at checkpoint:
+**phext encodes coordinate distance as unary delimiter runs**, so
+a component in the billions is billions of bytes of distance.
+Coordinates are positions, not hashes — identity belongs in
+content, coordinates are pagination. That is the round's sharpest
+finding, and it is a property of the format, derivable from its
+definition.
+
+**What the integration found in the engine (all fixed, all with
+regression tests; HoloPhext 0.2.1 → 0.2.4):**
+
+1. Recovery verified transactions through libphext fetches over
+   the raw WAL text — quadratic; a 10,050-transaction WAL burned
+   48 CPU-minutes. Recovery now verifies from the exploded map
+   (0.2.2).
+2. The commit path chained libphext's append per transaction —
+   quadratic the same way. The engine now owns an append cursor
+   and emits each batch's suffix in O(batch) (0.2.3).
+3. A crash splitting a UTF-8 sequence made the store unopenable
+   (`read_to_string` on the WAL). Open now truncates the file to
+   its UTF-8-valid prefix before replay (0.2.3).
+4. Applying a batch cloned the entire overlay map per
+   transaction — O(batch × map); SET throughput measured 1,490
+   ops/s. The overlay is now a compacted map plus a delta log:
+   a batch appends one delta entry, reads scan deltas
+   newest-first, and past 8,192 accumulated changes the writer
+   folds once — amortized O(1) per change (0.2.4).
+
+**Performance** (aletheia-core, release, same Python RESP client,
+same scenarios; round 2 re-measured the same day):
+
+| scenario | round 2 (hand-rolled) | round 3 (HoloPhext) |
+|---|---|---|
+| load 30,000 SETs | 0.19 s | 0.36 s |
+| SET pipeline-50, 10 threads | 156,614 ops/s | 74,659 ops/s |
+| GET pipeline-50 | 336,392 ops/s | 306,635 ops/s |
+| SET pipeline-1, 1 thread | 1,182 ops/s | 642 ops/s |
+| SET pipeline-1, 10 threads | 9,769 ops/s | 7,143 ops/s |
+| GET pipeline-1, 50 threads | 54,956 ops/s | 54,203 ops/s |
+| verify | 30,000/30,000 | 30,000/30,000 |
+
+**Durability.** SIGKILL mid-load: 160,800 writes acked at the
+kill; after restart DBSIZE read exactly 160,800 — zero acked
+writes lost (round 2's standard, met).
+
+**The remaining write gap is itemized, not mysterious:** ~210
+WAL bytes per op against round 2's ~60 — the checked-scroll
+checksum line on every entry, bucket-content reserialization,
+and one commit marker per batch. That is the price of per-scroll
+integrity and atomic multi-scroll commit, paid in bytes, and it
+buys what round 2 could not state at all: snapshot isolation,
+per-transaction verification, and an update stream for
+subscribers. Reads are at par. The phext-lattice re-implementation
+(steps 1–2) runs on the same engine at HoloPhext 0.2.4 with its
+full suite green (183 lib + 101 phext_edit + 4 + 3; the one
+failure, `local_editor_regression`, fails identically on
+unmodified exo).
